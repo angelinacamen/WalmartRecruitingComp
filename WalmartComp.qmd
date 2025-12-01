@@ -7,25 +7,26 @@ editor: visual
 ## Read in data
 ```{r}
 library(tidyverse)
-library(tidymodels)
-library(discrim)
-library(naivebayes)
 library(vroom)
-library(patchwork)
+library(tidymodels)
+library(DataExplorer)
+
+
 
 wlmtTrain <- vroom("~/Downloads/WalmartRecruitingComp/walmart-recruiting-store-sales-forecasting/train.csv")
 
 wlmtTest <- vroom("~/Downloads/WalmartRecruitingComp/walmart-recruiting-store-sales-forecasting/test.csv")
 wlmFeatures <- vroom("~/Downloads/WalmartRecruitingComp/walmart-recruiting-store-sales-forecasting/features.csv.zip")
+
+wlmSubmission <- vroom("~/Downloads/WalmartRecruitingComp/walmart-recruiting-store-sales-forecasting/sampleSubmission.csv")
 ```
 
-#Cleaning Feature Data
+
+## Cleaning Feature Data and Join on Test & Train
 ```{r}
 # =======================================================
 # 1. CLEAN FEATURES DATA
 # =======================================================
-
-markdown_vars <- c("MarkDown1", "MarkDown2", "MarkDown3", "MarkDown4", "MarkDown5")
 
 wlmFeatures_clean <- wlmFeatures %>%
   mutate(across(all_of(markdown_vars), ~ replace_na(.x, 0))) %>%
@@ -33,6 +34,12 @@ wlmFeatures_clean <- wlmFeatures %>%
   mutate(MarkdownFlag = if_else(TotalMarkdown > 0, 1, 0)) %>%
   dplyr::select(-all_of(markdown_vars))
 
+feature_recipe <- recipe(~., data=wlmFeatures_clean) %>%
+  step_mutate(DecDate = decimal_date(Date)) %>%
+  step_impute_bag(CPI, Unemployment,
+                  impute_with = imp_vars(DecDate, Store))
+
+imputed_features <- juice(prep(feature_recipe))
 
 # =======================================================
 # 2. JOIN CLEANED FEATURES WITH TRAIN AND TEST
@@ -41,16 +48,394 @@ wlmFeatures_clean <- wlmFeatures %>%
 # Ensure Date variables are proper Date type
 wlmtTrain <- wlmtTrain %>% mutate(Date = as.Date(Date))
 wlmtTest  <- wlmtTest  %>% mutate(Date = as.Date(Date))
-wlmFeatures_clean <- wlmFeatures_clean %>% mutate(Date = as.Date(Date))
+imputed_features <- wlmFeatures_clean %>% mutate(Date = as.Date(Date))
 
 train_joined <- wlmtTrain %>%
-  left_join(wlmFeatures_clean, by = c("Store", "Date", "IsHoliday"))
+  left_join(imputed_features, by = c("Store", "Date", "IsHoliday"))
 
 test_joined <- wlmtTest %>%
-  left_join(wlmFeatures_clean, by = c("Store", "Date", "IsHoliday"))
+  left_join(imputed_features, by = c("Store", "Date", "IsHoliday"))
 
 # View joined data
 glimpse(train_joined)
 glimpse(test_joined)
+```
+
+## Model 
+```{r}
+library(dplyr)
+
+# Get all unique Store-Dept combinations using dplyr::select explicitly
+store_dept_combos <- train_joined %>%
+  dplyr::select(Store, Dept) %>%
+  distinct()
+
+# Randomly sample one combination
+set.seed(123)  # for reproducibility
+random_combo <- store_dept_combos %>%
+  sample_n(1)
+
+random_combo
+
+random_dataTrain <- train_joined %>%
+  filter(Store == random_combo$Store, Dept == random_combo$Dept)
+
+random_dataTest <- test_joined %>%
+  filter(Store == random_combo$Store, Dept == random_combo$Dept)
+
+head(random_dataTrain)
+
+library(tidymodels)
+library(discrim)
+library(naivebayes)
+library(dplyr)
+
+# -----------------------------
+# 1. Prepare data
+# -----------------------------
+random_dataTrain <- random_dataTrain %>%
+  mutate(Store = factor(Store),
+         Dept = factor(Dept),
+         IsHoliday = factor(IsHoliday))
+
+random_dataTest <- random_dataTest %>%
+  mutate(Store = factor(Store),
+         Dept = factor(Dept),
+         IsHoliday = factor(IsHoliday))
+
+###############################################################################
+# Load packages
+###############################################################################
+library(tidymodels)
+library(vroom)
+library(lubridate)
+
+set.seed(123)  # reproducibility
+
+###############################################################################
+# Split training data into train/validation
+###############################################################################
+split <- initial_split(random_dataTrain, prop = 0.8)
+train_split <- training(split)
+val_split   <- testing(split)
+
+###############################################################################
+# Recipe for Random Forest
+###############################################################################
+rf_recipe <- recipe(Weekly_Sales ~ ., data = train_split) %>%
+  # Convert date to numeric
+  step_mutate(Date = as.numeric(Date)) %>%
+  # Convert logical/binary columns to numeric
+  step_mutate(
+    IsHoliday = as.numeric(IsHoliday),
+    MarkdownFlag = as.numeric(MarkdownFlag)
+  ) %>%
+  # Remove zero-variance predictors
+  step_zv(all_predictors())
+
+###############################################################################
+# Random Forest Model (tune number of trees and mtry)
+###############################################################################
+rf_model <- rand_forest(
+  mtry = tune(),
+  trees = 500,   # default number of trees
+  min_n = tune()
+) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+###############################################################################
+# Workflow
+###############################################################################
+rf_wf <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_model)
+
+###############################################################################
+# Tuning grid
+###############################################################################
+tuning_grid <- grid_random(
+  mtry(range = c(1, ncol(train_split)-1)),
+  min_n(range = c(2, 10)),
+  size = 10
+)
+
+###############################################################################
+# Cross-validation
+###############################################################################
+folds <- vfold_cv(train_split, v = 5)
+
+rf_tune <- tune_grid(
+  rf_wf,
+  resamples = folds,
+  grid = tuning_grid,
+  metrics = metric_set(rmse)
+)
+
+###############################################################################
+# Select best tuning parameters
+###############################################################################
+bestTune <- select_best(rf_tune, metric = "rmse")
+
+###############################################################################
+# Finalize workflow with best parameters
+###############################################################################
+final_rf_wf <- finalize_workflow(rf_wf, bestTune)
+
+###############################################################################
+# Fit final model on train split
+###############################################################################
+final_fit <- final_rf_wf %>%
+  fit(data = train_split)
+
+###############################################################################
+# Predict on validation set and compute RMSE
+###############################################################################
+val_predictions <- predict(final_fit, val_split) %>%
+  bind_cols(val_split)
+
+val_rmse <- rmse(val_predictions, truth = Weekly_Sales, estimate = .pred)
+print(val_rmse)
+
+###############################################################################
+# Fit final model on full training data for test prediction
+###############################################################################
+final_fit_full <- final_rf_wf %>%
+  fit(data = random_dataTrain)
+
+###############################################################################
+# Predict on test data
+###############################################################################
+test_predictions <- predict(final_fit_full, random_dataTest) %>%
+  bind_cols(random_dataTest)
+
+###############################################################################
+# Create Kaggle-style submission
+###############################################################################
+submission <- test_predictions %>%
+  mutate(
+    Date = as.character(Date),
+    Id = paste(Store, Dept, Date, sep = "_")
+  ) %>%
+  dplyr::select(Id, Weekly_Sales = .pred)
+
+# Write CSV
+vroom_write(submission, "./RandomForest_Submission.csv", delim = ",")
+
+```
+
+```{r}
+# =================================================
+# Tidyverse / tidymodels Regression Tree for Walmart Sales
+# Works perfectly with your random_dataTrain and random_dataTest
+# =================================================
+
+# Load tidyverse & tidymodels
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+
+# Set seed for reproducibility
+set.seed(123)
+
+# -------------------------------------------------
+# 1. Your data (already in environment)
+# -------------------------------------------------
+train <- random_dataTrain   # has Weekly_Sales
+test  <- random_dataTest    # no Weekly_Sales
+
+# -------------------------------------------------
+# 2. Feature engineering (tidy way)
+# -------------------------------------------------
+train <- train %>%
+  mutate(
+    Year         = year(Date) %>% as_factor(),
+    Month        = month(Date) %>% as_factor(),
+    Week         = week(Date) %>% as_factor(),
+    IsHoliday    = as_factor(IsHoliday),
+    Store        = as_factor(Store),
+    Dept         = as_factor(Dept),
+    MarkdownFlag = as_factor(MarkdownFlag)
+  )
+
+test <- test %>%
+  mutate(
+    Year         = year(Date) %>% as_factor(),
+    Month        = month(Date) %>% as_factor(),
+    Week         = week(Date) %>% as_factor(),
+    IsHoliday    = as_factor(IsHoliday),
+    Store        = as_factor(Store),
+    Dept         = as_factor(Dept),
+    MarkdownFlag = as_factor(MarkdownFlag)
+  ) %>%
+  mutate(Id = str_glue("{Store}_{Dept}_{Date}"))   # Exact submission Id format
+
+# -------------------------------------------------
+# 3. Split training data for honest performance estimate
+# -------------------------------------------------
+data_split <- initial_split(train, prop = 0.80)
+train_cv   <- training(data_split)
+test_cv    <- testing(data_split)
+
+# Optional: 5-fold CV (better than one holdout when data is small)
+folds <- vfold_cv(train_cv, v = 5)
+
+# -------------------------------------------------
+# 4. Recipe: define preprocessing + formula
+# -------------------------------------------------
+tree_recipe <- recipe(Weekly_Sales ~ Store + Dept + IsHoliday + Temperature + 
+                      Fuel_Price + CPI + Unemployment + TotalMarkdown + 
+                      MarkdownFlag + Year + Month + Week, data = train_cv)
+
+# -------------------------------------------------
+# 5. Model: decision tree with tuning
+# -------------------------------------------------
+tree_model <- decision_tree(
+  cost_complexity = tune(),   # cp parameter
+  tree_depth = tune(),
+  min_n = tune()
+) %>%
+  set_engine("rpart") %>%
+  set_mode("regression")
+
+# Workflow
+tree_wf <- workflow() %>%
+  add_recipe(tree_recipe) %>%
+  add_model(tree_model)
+
+# -------------------------------------------------
+# 6. Tune hyperparameters (fast with small data)
+# -------------------------------------------------
+tree_grid <- grid_regular(
+  cost_complexity(),
+  tree_depth(range = c(3, 15)),
+  min_n(range = c(5, 20)),
+  levels = 5
+)
+
+tree_tune <- tune_grid(
+  tree_wf,
+  resamples = folds,
+  grid = tree_grid,
+  metrics = metric_set(rmse)
+)
+
+# Best model
+best_params <- select_best(tree_tune, metric = "rmse")
+final_tree <- finalize_workflow(tree_wf, best_params)
+
+# -------------------------------------------------
+# 7. Fit final model on FULL training data
+# -------------------------------------------------
+final_fit <- fit(final_tree, data = train)
+
+# -------------------------------------------------
+# 8. Cross-validated RMSE (our honest score!)
+# -------------------------------------------------
+cv_rmse <- tree_tune %>%
+  collect_metrics() %>%
+  filter(.config == best_params$.config) %>%
+  pull(mean) %>% round(2)
+
+cat("Best cross-validated RMSE:", cv_rmse, "\n")
+
+# -------------------------------------------------
+# 9. Predict on real test set
+# -------------------------------------------------
+predictions <- predict(final_fit, new_data = test) %>%
+  bind_cols(test %>% select(Id)) %>%
+  select(Id, Weekly_Sales = .pred) %>%
+  mutate(Weekly_Sales = round(Weekly_Sales, 2))
+
+# -------------------------------------------------
+# 10. Save submission
+# -------------------------------------------------
+write_csv(predictions, "submission_tidymodels_tree.csv")
+
+cat("\nSubmission ready! First 10 predictions:\n")
+print(head(predictions, 10))
+cat("\nFile saved: submission_tidymodels_tree.csv\n")
+cat("Your estimated RMSE (5-fold CV):", cv_rmse, "\n")
+
+# Optional: show the tree (still works!)
+# final_fit %>% extract_fit_engine() %>% rpart.plot::rpart.plot(roundint = FALSE)
+```
+
+
+```{r}
+##########################################
+## 1 — Fit Prophet Model (Matching Your Structure)
+##########################################
+
+library(tidyverse)
+library(prophet)
+
+## Choose Store and Dept (YOU CHANGE THESE)
+store <- 24
+dept  <- 5
+
+## Filter and rename for Prophet syntax
+sd_train <- train_joined %>%
+  filter(Store == store, Dept == dept) %>%
+  rename(
+    y  = Weekly_Sales,  # Prophet needs y
+    ds = Date           # Prophet needs ds
+  )
+
+sd_test <- test_joined %>%
+  filter(Store == store, Dept == dept) %>%
+  rename(ds = Date)
+
+##########################################
+## 2 — Fit Prophet Model Using Real Regressors
+##########################################
+
+## Choose regressors that actually exist in your data
+## You may add or remove any of these
+prophet_model <- prophet() %>%
+  add_regressor("IsHoliday") %>%
+  add_regressor("Temperature") %>%
+  add_regressor("Fuel_Price") %>%
+  fit.prophet(sd_train)
+
+##########################################
+## 3 — Predictions
+##########################################
+
+## Fitted values (training period)
+fitted_vals <- predict(prophet_model, sd_train)
+
+## Forecast values (test period)
+test_preds <- predict(prophet_model, sd_test)
+
+##########################################
+## 4 — Plot Fitted + Forecast on One Graph
+##########################################
+
+ggplot() +
+  geom_line(
+    data = sd_train,
+    mapping = aes(x = ds, y = y, color = "Data")
+  ) +
+  geom_line(
+    data = fitted_vals,
+    mapping = aes(x = as.Date(ds), y = yhat, color = "Fitted")
+  ) +
+  geom_line(
+    data = test_preds,
+    mapping = aes(x = as.Date(ds), y = yhat, color = "Forecast")
+  ) +
+  scale_color_manual(values = c(
+    "Data"     = "black",
+    "Fitted"   = "blue",
+    "Forecast" = "red"
+  )) +
+  labs(
+    color = "",
+    title = paste("Store", store, "- Dept", dept),
+    x = "Date",
+    y = "Weekly Sales"
+  )
+
 ```
 
