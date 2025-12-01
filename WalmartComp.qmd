@@ -1,0 +1,56 @@
+---
+title: "WalmartComp"
+format: html
+editor: visual
+---
+
+## Read in data
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(discrim)
+library(naivebayes)
+library(vroom)
+library(patchwork)
+
+wlmtTrain <- vroom("~/Downloads/WalmartRecruitingComp/walmart-recruiting-store-sales-forecasting/train.csv")
+
+wlmtTest <- vroom("~/Downloads/WalmartRecruitingComp/walmart-recruiting-store-sales-forecasting/test.csv")
+wlmFeatures <- vroom("~/Downloads/WalmartRecruitingComp/walmart-recruiting-store-sales-forecasting/features.csv.zip")
+```
+
+#Cleaning Feature Data
+```{r}
+# =======================================================
+# 1. CLEAN FEATURES DATA
+# =======================================================
+
+markdown_vars <- c("MarkDown1", "MarkDown2", "MarkDown3", "MarkDown4", "MarkDown5")
+
+wlmFeatures_clean <- wlmFeatures %>%
+  mutate(across(all_of(markdown_vars), ~ replace_na(.x, 0))) %>%
+  mutate(TotalMarkdown = rowSums(across(all_of(markdown_vars)))) %>%
+  mutate(MarkdownFlag = if_else(TotalMarkdown > 0, 1, 0)) %>%
+  dplyr::select(-all_of(markdown_vars))
+
+
+# =======================================================
+# 2. JOIN CLEANED FEATURES WITH TRAIN AND TEST
+# =======================================================
+
+# Ensure Date variables are proper Date type
+wlmtTrain <- wlmtTrain %>% mutate(Date = as.Date(Date))
+wlmtTest  <- wlmtTest  %>% mutate(Date = as.Date(Date))
+wlmFeatures_clean <- wlmFeatures_clean %>% mutate(Date = as.Date(Date))
+
+train_joined <- wlmtTrain %>%
+  left_join(wlmFeatures_clean, by = c("Store", "Date", "IsHoliday"))
+
+test_joined <- wlmtTest %>%
+  left_join(wlmFeatures_clean, by = c("Store", "Date", "IsHoliday"))
+
+# View joined data
+glimpse(train_joined)
+glimpse(test_joined)
+```
+
